@@ -3,7 +3,7 @@ Description=Broadcasts system statistics to an mqtt server of your choice.
 After=network-online.target
 
 [Service]
-User=root
+User=%i
 ExecStart=/usr/bin/system-mqtt run
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

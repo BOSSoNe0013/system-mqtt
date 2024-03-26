@@ -8,9 +8,13 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use sysinfo::{CpuExt, DiskExt, System, SystemExt};
+use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
 use tokio::{fs, signal, time};
 use url::Url;
+use nvml_wrapper::NVML;
+use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use  nvml_wrapper::error::NvmlError as NvmlError;
+use nvml_wrapper::struct_wrappers::device::*;
 
 const KEYRING_SERVICE_NAME: &str = "system-mqtt";
 
@@ -53,6 +57,11 @@ struct DriveConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+struct NetworkConfig {
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
 enum PasswordSource {
     #[serde(rename = "keyring")]
     Keyring,
@@ -87,6 +96,9 @@ struct Config {
 
     /// The names of drives, or the paths to where they are mounted.
     drives: Vec<DriveConfig>,
+
+    /// The names of network interfaces.
+    network_interfaces: Vec<NetworkConfig>,
 }
 
 impl Default for Config {
@@ -99,6 +111,9 @@ impl Default for Config {
             drives: vec![DriveConfig {
                 path: PathBuf::from("/"),
                 name: String::from("root"),
+            }],
+            network_interfaces: vec![NetworkConfig {
+                name: String::from("eth0"),
             }],
         }
     }
@@ -233,6 +248,9 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     let mut system = System::new_all();
 
+    let nvml = NVML::init()?;
+    let gpu_count = nvml.device_count()?;
+ 
     let hostname = system
         .host_name()
         .context("Could not get system hostname.")?;
@@ -263,7 +281,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         .register_topic(
             "sensor",
             None,
-            Some(""),
+            Some("total"),
             "uptime",
             Some("days"),
             Some("mdi:timer-sand"),
@@ -341,9 +359,111 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             .context("Failed to register a filesystem topic.")?;
     }
 
+    // Register the sensors for network interfaces
+    for iface in &config.network_interfaces {
+        home_assistant
+            .register_topic(
+                "sensor",
+                None,
+                Some("total_increasing"),
+                &format!("{}/total_upload", iface.name),
+                Some("B"),
+                Some("mdi:upload-network"),
+            )
+            .await
+            .context("Failed to register a network topic.")?;
+        home_assistant
+            .register_topic(
+                "sensor",
+                None,
+                Some("measurement"),
+                &format!("{}/upload", iface.name),
+                Some("B"),
+                Some("mdi:upload-network"),
+            )
+            .await
+            .context("Failed to register a network topic.")?;
+        home_assistant
+            .register_topic(
+                "sensor",
+                None,
+                Some("total_increasing"),
+                &format!("{}/total_download", iface.name),
+                Some("B"),
+                Some("mdi:download-network"),
+            )
+            .await
+            .context("Failed to register a network topic.")?;
+        home_assistant
+            .register_topic(
+                "sensor",
+                None,
+                Some("measurement"),
+                &format!("{}/download", iface.name),
+                Some("B"),
+                Some("mdi:download-network"),
+            )
+            .await
+            .context("Failed to register a network topic.")?;
+    }
+
+    // Register the sensors for GPU interfaces
+    for i in 0..gpu_count {
+        let device = nvml.device_by_index(i)?;
+        match device.name() {
+            Ok(name) => {
+                home_assistant
+                .register_topic(
+                    "sensor",
+                    None,
+                    Some("measurement"),
+                    &format!("{}/temperature", name),
+                    Some("℃"),
+                    Some("mdi:thermometer"),
+                )
+                .await
+                .context("Failed to register a GPU temperature topic.")?;
+                home_assistant
+                .register_topic(
+                    "sensor",
+                    None,
+                    Some("measurement"),
+                    &format!("{}/fan_speed", name),
+                    Some("%"),
+                    Some("mdi:fan"),
+                )
+                .await
+                .context("Failed to register a GPU fan speed topic.")?;
+                home_assistant
+                .register_topic(
+                    "sensor",
+                    None,
+                    Some("measurement"),
+                    &format!("{}/usage", name),
+                    Some("%"),
+                    Some("mdi:gauge"),
+                )
+                .await
+                .context("Failed to register a GPU usage topic.")?;
+                home_assistant
+                .register_topic(
+                    "sensor",
+                    None,
+                    Some("measurement"),
+                    &format!("{}/memory", name),
+                    Some("%"),
+                    Some("mdi:gauge"),
+                )
+                .await
+                .context("Failed to register a GPU memory topic.")?;
+            },
+            Err(_err) => log::error!("Error while registering GPU#{} topict: {:?}", i, _err)
+        };
+}
+
     home_assistant.set_available(true).await?;
 
-    let result = availability_trampoline(&home_assistant, &mut system, config, manager).await;
+    let result = availability_trampoline(&home_assistant, &mut system, config, manager, &nvml).await;
 
     if let Err(error) = home_assistant.set_available(false).await {
         // I don't want this error hiding whatever happened in the main loop.
@@ -357,21 +477,60 @@ async fn application_trampoline(config: &Config) -> Result<()> {
     Ok(())
 }
 
+pub struct GPUstat {
+    name: Result<String, NvmlError>,
+    // compute_capability: Result<CudaComputeCapability, NvmlError>,
+    utilization_rates: Result<Utilization, NvmlError>,
+    memory_info: Result<MemoryInfo, NvmlError>,
+    fan_speed: Result<u32, NvmlError>,
+    temperature: Result<u32, NvmlError>,
+    //running_graphics_processes: Result<Vec<ProcessInfo>, NvmlError>,
+}
+
+pub fn read_gpu_stat(device: &nvml_wrapper::Device) -> GPUstat {
+    let gpustat = GPUstat {
+        name: device.name(),
+        // compute_capability: device.cuda_compute_capability(),
+        utilization_rates: device.utilization_rates(),
+        memory_info: device.memory_info(),
+        fan_speed: device.fan_speed(0), // Currently only take one fan, will add more fan readings
+        temperature: device.temperature(TemperatureSensor::Gpu),
+        // running_graphics_processes: device.running_graphics_processes(),
+    };
+
+    return gpustat;
+}
+
 async fn availability_trampoline(
     home_assistant: &HomeAssistant,
     system: &mut System,
     config: &Config,
     manager: battery::Manager,
+    nvml: &nvml_wrapper::NVML
 ) -> Result<()> {
     let drive_list: HashMap<PathBuf, String> = config
         .drives
         .iter()
         .map(|drive_config| (drive_config.path.clone(), drive_config.name.clone()))
         .collect();
+    let iface_list: Vec<String> = config
+        .network_interfaces
+        .iter()
+        .map(|iface_config| (iface_config.name.clone()))
+        .collect();
+
+    let gpu_count = nvml.device_count()?;
+   
 
     system.refresh_disks();
     system.refresh_memory();
     system.refresh_cpu();
+    system.refresh_networks_list();
+    system.refresh_networks();
+    
+    /*let networks = system.cloned().networks();
+    networks.refresh_networks_list();
+    networks.refresh();*/
 
     loop {
         tokio::select! {
@@ -379,6 +538,8 @@ async fn availability_trampoline(
                 system.refresh_disks();
                 system.refresh_memory();
                 system.refresh_cpu();
+                system.refresh_networks_list();
+                system.refresh_networks();
 
                 // Report uptime.
                 let uptime = system.uptime() as f32 / 60.0 / 60.0 / 24.0; // Convert from seconds to days.
@@ -404,7 +565,51 @@ async fn availability_trampoline(
                         home_assistant.publish(drive_name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
                     }
                 }
+                
+                // Report network usage.
+                for (interface_name, network) in system.networks() {
+                     if iface_list.contains(interface_name) {
+                        let total_upload = network.total_transmitted() as u64;
+                        let total_download = network.total_received() as u64;
+                        let upload = network.transmitted() as u64;
+                        let download = network.received() as u64;
+                        home_assistant.publish(&format!("{}/total_upload", interface_name), format!("{}", total_upload)).await;
+                        home_assistant.publish(&format!("{}/total_download", interface_name), format!("{}", total_download)).await;
+                        home_assistant.publish(&format!("{}/upload", interface_name), format!("{}", upload)).await;
+                        home_assistant.publish(&format!("{}/download", interface_name), format!("{}", download)).await;
+                    }
+                }
 
+                // Report GPU usage.
+                for i in 0..gpu_count {
+                    let device = nvml.device_by_index(i)?;
+                    let gpustat = read_gpu_stat(&device);
+                    match gpustat.name {
+                        Ok(name) => {
+                            match gpustat.temperature {
+                                Ok(temperature) => home_assistant.publish(&format!("{}/temperature", name), format!("{}", temperature)).await,
+                                Err(_err) => log::error!("Failed to read GPU#{} temperature: {:?}", i, _err)
+                            };
+                            match gpustat.fan_speed {
+                                Ok(fan_speed) => home_assistant.publish(&format!("{}/fan_speed", name), format!("{}", fan_speed)).await,
+                                Err(_err) => log::error!("Failed to read GPU#{} fan speed info: {:?}", i, _err),
+                            };
+                            match gpustat.utilization_rates {
+                                Ok(usage) => home_assistant.publish(&format!("{}/usage", name), format!("{}", usage.gpu)).await,
+                                Err(_err) => log::error!("Failed to read GPU#{} usage: {:?}", i, _err)
+                            };
+                            match gpustat.memory_info {
+                                Ok(memory) => {
+                                    let usage = (memory.used * 100) / memory.total;
+                                    home_assistant.publish(&format!("{}/memory", name), format!("{}", usage)).await
+                                },
+                                Err(_err) => log::error!("Failed to read GPU#{} memory: {:?}", i, _err)
+                            };
+                        },
+                        Err(_err) => log::error!("Failed to read GPU#{} info: {:?}", i, _err)
+                    };
+                }
+            
                 // TODO we should probably combine the battery charges, but for now we're just going to use the first detected battery.
                 if let Some(battery) = manager.batteries().context("Failed to read battery info.")?.flatten().next() {
                     use battery::State;
@@ -480,7 +685,7 @@ impl HomeAssistant {
         }
 
         let message = serde_json::ser::to_string(&TopicConfig {
-            name: format!("{}-{}", self.hostname, topic_name),
+            name: format!("{}-{}", self.hostname, topic_name.replace("/", "-")),
             device_class: device_class.map(str::to_string),
             state_class: state_class.map(str::to_string),
             state_topic: format!("system-mqtt/{}/{}", self.hostname, topic_name),
